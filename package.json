@@ -12,6 +12,7 @@
     "@discord-player/core": "^0.1.1",
     "@discord-player/extractor": "^7.1.0",
     "@prisma/client": "^5.22.0",
+    "axios": "^1.13.4",
     "cors": "^2.8.6",
     "discord.js": "^14.25.1",
     "dotenv": "^16.6.1",

@@ -1,75 +1,151 @@
-// index.js
-const { Client, Collection, GatewayIntentBits, Events } = require('discord.js');
+const { 
+    Client, 
+    Collection, 
+    GatewayIntentBits, 
+    Events, 
+    EmbedBuilder, 
+    ButtonBuilder, 
+    ButtonStyle, 
+    ActionRowBuilder 
+} = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
-const config = require('./config.json');
+const express = require('express');
+const cors = require('cors');
+const { PrismaClient } = require('@prisma/client'); // เพิ่ม Prisma เข้ามา
+require('dotenv').config();
 
-// ตั้งค่า Client พร้อม Intents ที่จำเป็น
+// --- 1. ตั้งค่า Client, Express และ Prisma ---
 const client = new Client({ 
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
     ] 
 });
 
 client.commands = new Collection();
+const app = express();
+const prisma = new PrismaClient(); // สร้างตัวเชื่อม Database
+const PORT = process.env.PORT || 4001;
 
-// --- 1. ส่วนโหลดคำสั่ง (Dynamic Command Loading) ---
+app.use(cors());
+app.use(express.json());
+
+// --- 2. ส่วนโหลดคำสั่ง (เหมือนเดิม) ---
 const commandsPath = path.join(__dirname, 'src', 'commands');
-
 if (fs.existsSync(commandsPath)) {
     const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
     for (const file of commandFiles) {
         const filePath = path.join(commandsPath, file);
         const command = require(filePath);
-        
-        // ตรวจสอบว่าไฟล์คำสั่งมีโครงสร้างที่ถูกต้องหรือไม่
         if ('data' in command && 'execute' in command) {
             client.commands.set(command.data.name, command);
-            console.log(`✅ โหลดคำสั่ง: ${command.data.name}`);
-        } else {
-            console.log(`[WARNING] คำสั่งที่ ${filePath} ขาดคุณสมบัติ "data" หรือ "execute"`);
         }
     }
-} else {
-    console.error(`❌ ไม่พบโฟลเดอร์คำสั่งที่: ${commandsPath}`);
 }
 
-// --- 2. ส่วนจัดการการตอบโต้ (Interaction Handling) ---
-client.on(Events.InteractionCreate, async interaction => {
-    // ตรวจสอบว่าเป็น Slash Command หรือไม่
-    if (!interaction.isChatInputCommand()) return;
+// --- 3. Webhook Endpoint (รับออเดอร์ + เพิ่มปุ่ม) ---
+app.post('/notify/new-order', async (req, res) => {
+    try {
+        const { orderId, totalAmount, items } = req.body;
+        console.log(`🔔 มีออเดอร์ใหม่เข้ามา! Order #${orderId}`);
 
-    const command = client.commands.get(interaction.commandName);
+        const channelId = process.env.YOUR_DISCORD_CHANNEL_ID;
+        const channel = client.channels.cache.get(channelId);
+        
+        if (channel) {
+            // A. สร้าง Embed (การ์ด)
+            const embed = new EmbedBuilder()
+                .setColor(0x0099FF) // สีฟ้า (สถานะ Pending)
+                .setTitle(`🍽️ มีออเดอร์ใหม่! (บิล #${orderId})`)
+                .setDescription(`ยอดรวม: **${totalAmount} บาท**`)
+                .addFields(
+                    { name: 'รายการอาหาร', value: items.map(i => `• ${i.name} (x${i.quantity})`).join('\n') || 'ไม่ระบุ' },
+                    { name: 'สถานะ', value: '🕒 รอทำอาหาร (Pending)', inline: true }
+                )
+                .setTimestamp()
+                .setFooter({ text: 'Pickled Shrimp POS System' });
 
-    if (!command) {
-        console.error(`ไม่พบคำสั่ง ${interaction.commandName}`);
-        return;
+            // B. สร้างปุ่ม (Button)
+            const completeButton = new ButtonBuilder()
+                .setCustomId(`complete_${orderId}`) // ฝัง ID ออเดอร์ไว้ในปุ่ม
+                .setLabel('✅ ทำเสร็จแล้ว (Complete)')
+                .setStyle(ButtonStyle.Success); // ปุ่มสีเขียว
+
+            const row = new ActionRowBuilder().addComponents(completeButton);
+
+            // ส่งข้อความพร้อมปุ่ม
+            await channel.send({ embeds: [embed], components: [row] });
+            return res.json({ success: true });
+        } else {
+            return res.status(404).json({ error: "Channel not found" });
+        }
+    } catch (error) {
+        console.error("Webhook Error:", error);
+        res.status(500).json({ error: "Internal Server Error" });
     }
+});
 
+// --- 4. ส่วนจัดการการกดปุ่ม (Button Interaction) ---
+client.on(Events.InteractionCreate, async interaction => {
+    // ถ้าไม่ใช่การกดปุ่ม ให้ข้ามไป
+    if (!interaction.isButton()) return;
+
+    // เช็คว่าเป็นปุ่ม "ทำเสร็จแล้ว" หรือไม่
+    if (interaction.customId.startsWith('complete_')) {
+        const orderId = interaction.customId.split('_')[1]; // ดึงเลข ID จาก customId
+
+        try {
+            // 1. อัปเดตสถานะใน Database เป็น Completed
+            // (ต้องใช้ Prisma Update ข้อมูลจริง)
+            await prisma.order.update({
+                where: { id: parseInt(orderId) },
+                data: { status: 'Completed' }
+            });
+
+            // 2. แก้ไขข้อความใน Discord (เปลี่ยนสี + ลบปุ่ม)
+            const oldEmbed = interaction.message.embeds[0];
+            
+            const newEmbed = new EmbedBuilder(oldEmbed.data)
+                .setColor(0x00FF00) // เปลี่ยนเป็นสีเขียว
+                .setTitle(`✅ ออเดอร์เสร็จสิ้น! (บิล #${orderId})`)
+                .setFields(
+                    // คงรายการอาหารไว้ แต่แก้สถานะ
+                    { name: oldEmbed.fields[0].name, value: oldEmbed.fields[0].value },
+                    { name: 'สถานะ', value: '🍳 ปรุงเสร็จแล้ว (Completed)', inline: true },
+                    { name: 'ผู้ดำเนินการ', value: `โดย ${interaction.user.username}`, inline: true }
+                );
+
+            // อัปเดตข้อความเดิม (ลบปุ่มออกด้วย components: [])
+            await interaction.update({ embeds: [newEmbed], components: [] });
+            console.log(`✅ ออเดอร์ #${orderId} ถูกกดจบงานแล้ว`);
+
+        } catch (error) {
+            console.error("Error updating order:", error);
+            await interaction.reply({ content: '❌ เกิดข้อผิดพลาดในการอัปเดตข้อมูล!', ephemeral: true });
+        }
+    }
+});
+
+// --- ส่วน Slash Command เดิม ---
+client.on(Events.InteractionCreate, async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
     try {
         await command.execute(interaction);
     } catch (error) {
-        console.error(`❌ เกิดข้อผิดพลาดที่คำสั่ง ${interaction.commandName}:`, error);
-        
-        // ตรวจสอบว่าบอทเคยตอบกลับไปหรือยัง เพื่อเลือกใช้ reply หรือ followUp
-        const errorMessage = { content: '❌ เกิดข้อผิดพลาดในการรันคำสั่งนี้!', ephemeral: true };
-        
-        if (interaction.replied || interaction.deferred) {
-            await interaction.followUp(errorMessage);
-        } else {
-            await interaction.reply(errorMessage);
-        }
+        console.error(error);
     }
 });
 
-// --- 3. ส่วนเริ่มต้นการทำงาน (Ready Event) ---
+// --- 5. เริ่มต้นการทำงาน ---
 client.once(Events.ClientReady, (c) => {
-    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     console.log(`🚀 บอทออนไลน์แล้ว! ชื่อ: ${c.user.tag}`);
-    console.log(`📅 วันที่: ${new Date().toLocaleString()}`);
-    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    app.listen(PORT, () => {
+        console.log(`👂 Webhook Listener เปิดที่ Port: ${PORT}`);
+    });
 });
 
-// ล็อกอินบอทด้วย Token จาก config.json
-client.login(config.token);
+client.login(process.env.DISCORD_TOKEN);

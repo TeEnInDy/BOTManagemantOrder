@@ -1,0 +1,78 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())
+  name        String
+  price       Decimal  @db.Decimal(10, 2)
+  category    String
+  description String?  @db.Text
+  image       String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  orderItems  OrderItem[]
+}
+
+model StockItem {
+  id                Int      @id @default(autoincrement())
+  name              String
+  category          String
+  quantity          Decimal  @db.Decimal(10, 2)
+  unit              String
+  costPerUnit       Decimal  @db.Decimal(10, 2)
+  lowStockThreshold Int      @default(5)
+  updatedAt         DateTime @updatedAt
+}
+
+model Order {
+  id              Int         @id @default(autoincrement())
+  customerName    String?
+  discordUserId   String?
+  discordChannelId String?
+  totalAmount     Decimal     @db.Decimal(10, 2)
+  paymentMethod   String?
+  status          OrderStatus @default(Pending)
+  note            String?     @db.Text
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  items           OrderItem[]
+}
+
+enum OrderStatus {
+  Pending
+  Cooking
+  Completed
+  Cancelled
+}
+
+model OrderItem {
+  id          Int      @id @default(autoincrement())
+  orderId     Int
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   Int?
+  product     Product? @relation(fields: [productId], references: [id])
+  productName String
+  quantity    Int
+  priceAtTime Decimal  @db.Decimal(10, 2)
+}
+
+model Transaction {
+  id          Int             @id @default(autoincrement())
+  type        TransactionType
+  category    String
+  amount      Decimal         @db.Decimal(10, 2)
+  description String?
+  createdAt   DateTime        @default(now())
+}
+
+enum TransactionType {
+  Income
+  Expense
+}

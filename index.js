@@ -1,38 +1,28 @@
-const { 
-    Client, 
-    Collection, 
-    GatewayIntentBits, 
-    Events, 
-    EmbedBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
-    ActionRowBuilder 
-} = require('discord.js');
+const { Client, Collection, GatewayIntentBits, Events, EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
 const cors = require('cors');
-const { PrismaClient } = require('@prisma/client'); // เพิ่ม Prisma เข้ามา
+const axios = require('axios');
 require('dotenv').config();
 
-// --- 1. ตั้งค่า Client, Express และ Prisma ---
-const client = new Client({ 
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ] 
+// ================= CONFIG =================
+const PORT = 4001; // Port สำหรับรับ Alert จากเว็บ
+const BACKEND_URL = 'http://localhost:4000/api/orders'; // URL Backend หลัก
+const CHANNEL_ID = '1466008300909891725'; // 🔴 ห้องที่จะให้แจ้งเตือน Alert
+// ==========================================
+
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 client.commands = new Collection();
-const app = express();
-const prisma = new PrismaClient(); // สร้างตัวเชื่อม Database
-const PORT = process.env.PORT || 4001;
+const app = express(); // สร้าง Express App ใน index เลย
 
 app.use(cors());
 app.use(express.json());
 
-// --- 2. ส่วนโหลดคำสั่ง (เหมือนเดิม) ---
+// --- 1. โหลดคำสั่ง Slash Commands ---
 const commandsPath = path.join(__dirname, 'src', 'commands');
 if (fs.existsSync(commandsPath)) {
     const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
@@ -45,106 +35,105 @@ if (fs.existsSync(commandsPath)) {
     }
 }
 
-// --- 3. Webhook Endpoint (รับออเดอร์ + เพิ่มปุ่ม) ---
+// --- 2. Webhook รับออเดอร์จากหน้าเว็บ (ย้ายมาจาก alert.js) ---
 app.post('/notify/new-order', async (req, res) => {
     try {
-        const { orderId, totalAmount, items } = req.body;
-        console.log(`🔔 มีออเดอร์ใหม่เข้ามา! Order #${orderId}`);
+        const { orderId, totalAmount, items, customerName } = req.body;
+        console.log(`🔔 Web Alert: Order #${orderId}`);
 
-        const channelId = process.env.YOUR_DISCORD_CHANNEL_ID;
-        const channel = client.channels.cache.get(channelId);
-        
+        const channel = await client.channels.fetch(CHANNEL_ID);
         if (channel) {
-            // A. สร้าง Embed (การ์ด)
+            const itemsList = items.map(i => `• ${i.name} (x${i.quantity})`).join('\n');
+            
             const embed = new EmbedBuilder()
-                .setColor(0x0099FF) // สีฟ้า (สถานะ Pending)
+                .setColor(0x3498db)
                 .setTitle(`🍽️ มีออเดอร์ใหม่! (บิล #${orderId})`)
-                .setDescription(`ยอดรวม: **${totalAmount} บาท**`)
+                .setDescription(`**ลูกค้า:** ${customerName || 'หน้าร้าน'}`)
                 .addFields(
-                    { name: 'รายการอาหาร', value: items.map(i => `• ${i.name} (x${i.quantity})`).join('\n') || 'ไม่ระบุ' },
-                    { name: 'สถานะ', value: '🕒 รอทำอาหาร (Pending)', inline: true }
+                    { name: '💵 ยอดรวม', value: `\`${Number(totalAmount).toLocaleString()} บาท\``, inline: true },
+                    { name: '📦 รายการอาหาร', value: itemsList || '-', inline: false },
+                    { name: '🕒 สถานะ', value: '⏳ รอทำอาหาร (Pending)', inline: true }
                 )
-                .setTimestamp()
-                .setFooter({ text: 'Pickled Shrimp POS System' });
+                .setTimestamp();
 
-            // B. สร้างปุ่ม (Button)
-            const completeButton = new ButtonBuilder()
-                .setCustomId(`complete_${orderId}`) // ฝัง ID ออเดอร์ไว้ในปุ่ม
-                .setLabel('✅ ทำเสร็จแล้ว (Complete)')
-                .setStyle(ButtonStyle.Success); // ปุ่มสีเขียว
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`complete_${orderId}`).setLabel('✅ ทำเสร็จแล้ว').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`cancel_${orderId}`).setLabel('❌ ยกเลิกบิล').setStyle(ButtonStyle.Danger)
+            );
 
-            const row = new ActionRowBuilder().addComponents(completeButton);
-
-            // ส่งข้อความพร้อมปุ่ม
             await channel.send({ embeds: [embed], components: [row] });
             return res.json({ success: true });
-        } else {
-            return res.status(404).json({ error: "Channel not found" });
         }
+        return res.status(404).send('Channel not found');
     } catch (error) {
         console.error("Webhook Error:", error);
-        res.status(500).json({ error: "Internal Server Error" });
+        res.status(500).send({ error: error.message });
     }
 });
 
-// --- 4. ส่วนจัดการการกดปุ่ม (Button Interaction) ---
+// --- 3. ตัวจัดการปุ่มกด (Global Button Handler) ---
 client.on(Events.InteractionCreate, async interaction => {
-    // ถ้าไม่ใช่การกดปุ่ม ให้ข้ามไป
-    if (!interaction.isButton()) return;
+    // 3.1 จัดการ Slash Command (/order)
+    if (interaction.isChatInputCommand()) {
+        const command = client.commands.get(interaction.commandName);
+        if (!command) return;
+        try { await command.execute(interaction); } 
+        catch (error) { console.error(error); }
+        return;
+    }
 
-    // เช็คว่าเป็นปุ่ม "ทำเสร็จแล้ว" หรือไม่
-    if (interaction.customId.startsWith('complete_')) {
-        const orderId = interaction.customId.split('_')[1]; // ดึงเลข ID จาก customId
+    // 3.2 จัดการปุ่มกด (Complete / Cancel)
+    if (interaction.isButton()) {
+        // เช็คก่อนว่าเป็นปุ่มของเราไหม (complete_XXX หรือ cancel_XXX)
+        if (!interaction.customId.startsWith('complete_') && !interaction.customId.startsWith('cancel_')) return;
+
+        const [action, orderId] = interaction.customId.split('_');
+        
+        // ตอบกลับ Discord ทันทีว่า "กำลังคิด..." เพื่อป้องกัน Error "Interaction Failed"
+        await interaction.deferUpdate(); 
 
         try {
-            // 1. อัปเดตสถานะใน Database เป็น Completed
-            // (ต้องใช้ Prisma Update ข้อมูลจริง)
-            await prisma.order.update({
-                where: { id: parseInt(orderId) },
-                data: { status: 'Completed' }
-            });
+            if (action === 'complete') {
+                // ยิงไป Backend
+                await axios.patch(`${BACKEND_URL}/${orderId}/status`, { status: 'Completed' });
 
-            // 2. แก้ไขข้อความใน Discord (เปลี่ยนสี + ลบปุ่ม)
-            const oldEmbed = interaction.message.embeds[0];
+                // อัปเดต Embed
+                const oldEmbed = interaction.message.embeds[0];
+                const newEmbed = new EmbedBuilder(oldEmbed.data)
+                    .setColor(0x2ecc71) // เขียว
+                    .spliceFields(2, 1, { name: '✅ สถานะ', value: 'เสร็จสิ้น (Completed)', inline: true });
+
+                // ปิดปุ่ม
+                const disabledRow = ActionRowBuilder.from(interaction.message.components[0]);
+                disabledRow.components.forEach(btn => btn.setDisabled(true));
+
+                await interaction.editReply({ content: `✅ **บิล #${orderId}** จบงานแล้ว!`, embeds: [newEmbed], components: [disabledRow] });
             
-            const newEmbed = new EmbedBuilder(oldEmbed.data)
-                .setColor(0x00FF00) // เปลี่ยนเป็นสีเขียว
-                .setTitle(`✅ ออเดอร์เสร็จสิ้น! (บิล #${orderId})`)
-                .setFields(
-                    // คงรายการอาหารไว้ แต่แก้สถานะ
-                    { name: oldEmbed.fields[0].name, value: oldEmbed.fields[0].value },
-                    { name: 'สถานะ', value: '🍳 ปรุงเสร็จแล้ว (Completed)', inline: true },
-                    { name: 'ผู้ดำเนินการ', value: `โดย ${interaction.user.username}`, inline: true }
-                );
+            } else if (action === 'cancel') {
+                await axios.patch(`${BACKEND_URL}/${orderId}/status`, { status: 'Cancelled' });
 
-            // อัปเดตข้อความเดิม (ลบปุ่มออกด้วย components: [])
-            await interaction.update({ embeds: [newEmbed], components: [] });
-            console.log(`✅ ออเดอร์ #${orderId} ถูกกดจบงานแล้ว`);
+                const oldEmbed = interaction.message.embeds[0];
+                const newEmbed = new EmbedBuilder(oldEmbed.data)
+                    .setColor(0xe74c3c) // แดง
+                    .spliceFields(2, 1, { name: '❌ สถานะ', value: 'ยกเลิก (Cancelled)', inline: true });
 
+                const disabledRow = ActionRowBuilder.from(interaction.message.components[0]);
+                disabledRow.components.forEach(btn => btn.setDisabled(true));
+
+                await interaction.editReply({ content: `❌ **บิล #${orderId}** ถูกยกเลิกแล้ว`, embeds: [newEmbed], components: [disabledRow] });
+            }
         } catch (error) {
-            console.error("Error updating order:", error);
-            await interaction.reply({ content: '❌ เกิดข้อผิดพลาดในการอัปเดตข้อมูล!', ephemeral: true });
+            console.error('Button API Error:', error.message);
+            await interaction.followUp({ content: '❌ เชื่อมต่อ Backend ไม่ได้ หรือ Order นี้ไม่มีอยู่จริง', ephemeral: true });
         }
     }
 });
 
-// --- ส่วน Slash Command เดิม ---
-client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    const command = client.commands.get(interaction.commandName);
-    if (!command) return;
-    try {
-        await command.execute(interaction);
-    } catch (error) {
-        console.error(error);
-    }
-});
-
-// --- 5. เริ่มต้นการทำงาน ---
-client.once(Events.ClientReady, (c) => {
-    console.log(`🚀 บอทออนไลน์แล้ว! ชื่อ: ${c.user.tag}`);
+// --- 4. Start Server ---
+client.once(Events.ClientReady, c => {
+    console.log(`🚀 Bot Ready! Logged in as ${c.user.tag}`);
     app.listen(PORT, () => {
-        console.log(`👂 Webhook Listener เปิดที่ Port: ${PORT}`);
+        console.log(`📡 Alert Server running on port ${PORT}`);
     });
 });
 
